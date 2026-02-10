@@ -1,0 +1,969 @@
+#!/usr/bin/env python3
+"""claude-sync - Transfer Claude Code sessions between machines"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from datetime import datetime
+from pathlib import Path
+
+CLAUDE_DIR = Path.home() / ".claude"
+PROJECTS_DIR = CLAUDE_DIR / "projects"
+HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
+DEFAULT_EXPORT = Path.home() / "claude-sessions-backup.tar.gz"
+
+# === SSH Utilities ===
+
+# Global for connection reuse
+_ssh_control_path = None
+_ssh_remote = None
+
+def parse_remote(remote: str) -> tuple:
+    """Parse user@host:port into (user, host, port)"""
+    port = 22
+    if ":" in remote and "@" in remote:
+        # user@host:port
+        user_host, port_str = remote.rsplit(":", 1)
+        if port_str.isdigit():
+            port = int(port_str)
+            remote = user_host
+
+    if "@" in remote:
+        user, host = remote.split("@", 1)
+    else:
+        user = None
+        host = remote
+
+    return user, host, port
+
+
+def ssh_connect(remote: str) -> bool:
+    """Establish SSH connection with multiplexing. Returns True on success."""
+    global _ssh_control_path, _ssh_remote
+
+    user, host, port = parse_remote(remote)
+    ssh_target = f"{user}@{host}" if user else host
+
+    # Create control socket path
+    _ssh_control_path = f"/tmp/claude-sync-ssh-{os.getpid()}"
+    _ssh_remote = remote
+
+    # Start master connection
+    ssh_cmd = [
+        "ssh", "-p", str(port),
+        "-o", "ConnectTimeout=10",
+        "-o", "ControlMaster=yes",
+        "-o", f"ControlPath={_ssh_control_path}",
+        "-o", "ControlPersist=60",
+        "-N", "-f",  # Go to background
+        ssh_target
+    ]
+
+    try:
+        result = subprocess.run(ssh_cmd)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def ssh_disconnect():
+    """Close SSH master connection."""
+    global _ssh_control_path, _ssh_remote
+
+    if _ssh_control_path and os.path.exists(_ssh_control_path):
+        try:
+            subprocess.run(["ssh", "-O", "exit", "-o", f"ControlPath={_ssh_control_path}", "dummy"],
+                          capture_output=True)
+        except Exception:
+            pass
+
+    _ssh_control_path = None
+    _ssh_remote = None
+
+
+def _get_ssh_opts():
+    """Get SSH options for connection reuse."""
+    if _ssh_control_path:
+        return ["-o", f"ControlPath={_ssh_control_path}"]
+    return []
+
+
+def ssh_run(remote: str, command: str, capture: bool = True) -> tuple:
+    """Run a command on remote host via SSH. Returns (returncode, stdout, stderr)"""
+    user, host, port = parse_remote(remote)
+
+    ssh_target = f"{user}@{host}" if user else host
+    ssh_cmd = ["ssh", "-p", str(port), "-o", "ConnectTimeout=10"] + _get_ssh_opts() + [ssh_target, command]
+
+    try:
+        if capture:
+            result = subprocess.run(ssh_cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return result.returncode, result.stdout, result.stderr
+        else:
+            result = subprocess.run(ssh_cmd)
+            return result.returncode, "", ""
+    except Exception as e:
+        return 1, "", str(e)
+
+
+def scp_to(remote: str, local_path: str, remote_path: str) -> bool:
+    """Copy file to remote host. Returns True on success."""
+    user, host, port = parse_remote(remote)
+
+    ssh_target = f"{user}@{host}" if user else host
+    scp_cmd = ["scp", "-P", str(port), "-o", "ConnectTimeout=10"] + _get_ssh_opts() + [
+               local_path, f"{ssh_target}:{remote_path}"]
+
+    try:
+        result = subprocess.run(scp_cmd)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def scp_from(remote: str, remote_path: str, local_path: str) -> bool:
+    """Copy file from remote host. Returns True on success."""
+    user, host, port = parse_remote(remote)
+
+    ssh_target = f"{user}@{host}" if user else host
+    scp_cmd = ["scp", "-P", str(port), "-o", "ConnectTimeout=10"] + _get_ssh_opts() + [
+               f"{ssh_target}:{remote_path}", local_path]
+
+    try:
+        result = subprocess.run(scp_cmd)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+# === Path Utilities ===
+
+def encode_path(path: str) -> str:
+    """Encode a path for use as directory name: /Users/alice/project -> -Users-alice-project"""
+    return path.replace("/", "-")
+
+
+def remap_path(path: str, old_home: str, new_home: str) -> str:
+    """Remap a path from old home directory to new home directory"""
+    if path.startswith(old_home):
+        return new_home + path[len(old_home):]
+    return path
+
+
+def remap_encoded_dirname(dirname: str, old_home: str, new_home: str) -> str:
+    """Remap an encoded directory name from old home to new home"""
+    old_encoded = encode_path(old_home)
+    new_encoded = encode_path(new_home)
+    if dirname.startswith(old_encoded):
+        return new_encoded + dirname[len(old_encoded):]
+    return dirname
+
+
+# === Time Formatting ===
+
+def format_relative_time(dt: datetime) -> str:
+    """Format datetime as relative time string"""
+    now = datetime.now()
+    if dt.tzinfo:
+        dt = dt.replace(tzinfo=None)
+
+    delta = now - dt
+    seconds = delta.total_seconds()
+
+    if seconds < 60:
+        return "just now"
+    elif seconds < 3600:
+        mins = int(seconds / 60)
+        return f"{mins}m ago"
+    elif seconds < 86400:
+        hours = int(seconds / 3600)
+        return f"{hours}h ago"
+    elif seconds < 604800:
+        days = int(seconds / 86400)
+        return f"{days}d ago"
+    elif seconds < 2592000:
+        weeks = int(seconds / 604800)
+        return f"{weeks}w ago"
+    else:
+        months = int(seconds / 2592000)
+        return f"{months}mo ago"
+
+
+def parse_iso_time(s: str) -> datetime:
+    """Parse ISO format timestamp"""
+    # Handle various ISO formats
+    s = s.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        # Fallback for other formats
+        return datetime.now()
+
+
+# === Session Scanner ===
+
+def scan_sessions() -> dict:
+    """Scan all sessions and return grouped by project"""
+    if not PROJECTS_DIR.exists():
+        return {}
+
+    projects = {}
+
+    for project_dir in PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+
+        index_file = project_dir / "sessions-index.json"
+        if not index_file.exists():
+            continue
+
+        try:
+            with open(index_file) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            continue
+
+        entries = data.get("entries", [])
+        if not entries:
+            continue
+
+        # Get project name from projectPath of first entry
+        project_path = entries[0].get("projectPath", "")
+        project_name = Path(project_path).name if project_path else project_dir.name
+
+        # Find most recent session
+        latest = None
+        for entry in entries:
+            modified = entry.get("modified")
+            if modified:
+                dt = parse_iso_time(modified)
+                if latest is None or dt > latest:
+                    latest = dt
+
+        projects[project_dir.name] = {
+            "name": project_name,
+            "dir": project_dir,
+            "session_count": len(entries),
+            "last_active": latest,
+            "project_path": entries[0].get("projectPath", ""),
+            "entries": entries
+        }
+
+    return projects
+
+
+def find_sessions_by_id(session_ids: list) -> dict:
+    """Find sessions by ID (partial match supported) and return {dirname: {info, filtered_entries}}"""
+    projects = scan_sessions()
+    result = {}
+
+    for sid_query in session_ids:
+        sid_query = sid_query.lower()
+        found = False
+
+        for dirname, info in projects.items():
+            for entry in info["entries"]:
+                full_sid = entry["sessionId"].lower()
+                # Match full ID or prefix
+                if full_sid == sid_query or full_sid.startswith(sid_query):
+                    if dirname not in result:
+                        result[dirname] = {
+                            "name": info["name"],
+                            "dir": info["dir"],
+                            "project_path": info["project_path"],
+                            "filtered_entries": []
+                        }
+                    # Avoid duplicates
+                    if entry not in result[dirname]["filtered_entries"]:
+                        result[dirname]["filtered_entries"].append(entry)
+                    found = True
+
+        if not found:
+            print(f"Warning: Session '{sid_query}' not found")
+
+    return result
+
+
+# === Commands ===
+
+def cmd_list(show_details: bool = False):
+    """List all sessions grouped by project"""
+    projects = scan_sessions()
+
+    if not projects:
+        print("No sessions found in ~/.claude")
+        print("Start a Claude Code session to create one.")
+        return 0
+
+    print("\nSessions in ~/.claude:\n")
+
+    # Sort by last active time
+    sorted_projects = sorted(
+        projects.items(),
+        key=lambda x: x[1]["last_active"] or datetime.min,
+        reverse=True
+    )
+
+    total_sessions = 0
+    for dirname, info in sorted_projects:
+        name = info["name"]
+        count = info["session_count"]
+        total_sessions += count
+
+        time_str = format_relative_time(info["last_active"]) if info["last_active"] else "unknown"
+        sessions_word = "session" if count == 1 else "sessions"
+
+        # Pad name to align columns
+        print(f"  {name:<20} {count:>2} {sessions_word:<8}  last active: {time_str}")
+
+        # Show individual sessions if --details flag
+        if show_details:
+            index_file = info["dir"] / "sessions-index.json"
+            if index_file.exists():
+                with open(index_file) as f:
+                    data = json.load(f)
+                entries = sorted(
+                    data.get("entries", []),
+                    key=lambda e: e.get("modified", ""),
+                    reverse=True
+                )
+                for entry in entries:
+                    sid = entry.get("sessionId", "")[:8]
+                    prompt = entry.get("firstPrompt", "")[:50]
+                    if len(entry.get("firstPrompt", "")) > 50:
+                        prompt += "..."
+                    modified = entry.get("modified", "")
+                    if modified:
+                        mod_time = format_relative_time(parse_iso_time(modified))
+                    else:
+                        mod_time = "unknown"
+                    print(f"      {sid}  {mod_time:<10}  {prompt}")
+
+    print(f"\nTotal: {total_sessions} sessions, {len(projects)} projects")
+    print("\nCommands:")
+    print("  claude-sync --details                 Show session details")
+    print("  claude-sync push user@host            Push sessions to remote")
+    print("  claude-sync pull user@host            Pull sessions from remote")
+    print("  claude-sync list user@host            List sessions on remote")
+
+    return 0
+
+
+def cmd_export(output: Path, project_filter: str = None, session_ids: list = None):
+    """Export all sessions to a tar.gz archive"""
+    if not PROJECTS_DIR.exists():
+        print("Error: No projects found in ~/.claude/projects")
+        return 1
+
+    # Session-specific export
+    if session_ids:
+        filtered_projects = find_sessions_by_id(session_ids)
+        if not filtered_projects:
+            print("Error: No matching sessions found")
+            return 1
+
+        # Build manifest
+        manifest = {
+            "source_home": str(Path.home()),
+            "created": datetime.now().isoformat(),
+            "projects": {}
+        }
+
+        for dirname, info in filtered_projects.items():
+            manifest["projects"][dirname] = info["project_path"]
+
+        # Create tar.gz with only selected sessions
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = Path(tmpdir)
+
+            manifest_path = tmpdir / "manifest.json"
+            with open(manifest_path, "w") as f:
+                json.dump(manifest, f, indent=2)
+
+            projects_tmp = tmpdir / "projects"
+            projects_tmp.mkdir()
+
+            total_sessions = 0
+            for dirname, info in filtered_projects.items():
+                dst_dir = projects_tmp / dirname
+                dst_dir.mkdir()
+
+                # Write filtered sessions-index.json
+                index_data = {"version": 1, "entries": info["filtered_entries"]}
+                with open(dst_dir / "sessions-index.json", "w") as f:
+                    json.dump(index_data, f, indent=2)
+
+                # Copy only the selected session .jsonl files
+                for entry in info["filtered_entries"]:
+                    session_id = entry["sessionId"]
+                    src_file = info["dir"] / f"{session_id}.jsonl"
+                    if src_file.exists():
+                        with open(src_file, "rb") as src:
+                            with open(dst_dir / f"{session_id}.jsonl", "wb") as dst:
+                                dst.write(src.read())
+                        total_sessions += 1
+
+            # Filter history.jsonl to only include selected sessions
+            if HISTORY_FILE.exists():
+                selected_session_ids = set()
+                for info in filtered_projects.values():
+                    for entry in info["filtered_entries"]:
+                        selected_session_ids.add(entry["sessionId"])
+
+                history_lines = []
+                with open(HISTORY_FILE) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                            if obj.get("sessionId") in selected_session_ids:
+                                history_lines.append(line)
+                        except json.JSONDecodeError:
+                            pass
+
+                if history_lines:
+                    with open(tmpdir / "history.jsonl", "w") as f:
+                        f.write("\n".join(history_lines) + "\n")
+
+            with tarfile.open(output, "w:gz") as tar:
+                for item in tmpdir.iterdir():
+                    tar.add(item, arcname=item.name)
+
+        size_bytes = output.stat().st_size
+        if size_bytes < 1024:
+            size_str = f"{size_bytes}B"
+        elif size_bytes < 1024 * 1024:
+            size_str = f"{size_bytes / 1024:.1f}KB"
+        else:
+            size_str = f"{size_bytes / (1024 * 1024):.1f}MB"
+
+        print(f"Exported {total_sessions} sessions")
+        print(f"Archive: {output} ({size_str})")
+        return 0
+
+    # Project or full export
+    projects = scan_sessions()
+    if not projects:
+        print("Error: No sessions found to export")
+        return 1
+
+    # Filter by project name if specified
+    if project_filter:
+        filtered = {}
+        for dirname, info in projects.items():
+            if info["name"].lower() == project_filter.lower() or project_filter.lower() in info["name"].lower():
+                filtered[dirname] = info
+        if not filtered:
+            print(f"Error: No project matching '{project_filter}'")
+            print("Available projects:")
+            for dirname, info in projects.items():
+                print(f"  {info['name']}")
+            return 1
+        projects = filtered
+
+    # Build manifest with original paths
+    manifest = {
+        "source_home": str(Path.home()),
+        "created": datetime.now().isoformat(),
+        "projects": {}
+    }
+
+    for dirname, info in projects.items():
+        manifest["projects"][dirname] = info["project_path"]
+
+    # Create tar.gz
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        # Write manifest
+        manifest_path = tmpdir / "manifest.json"
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+
+        # Create projects directory structure
+        projects_tmp = tmpdir / "projects"
+        projects_tmp.mkdir()
+
+        # Copy project directories
+        for dirname in projects:
+            src_dir = PROJECTS_DIR / dirname
+            dst_dir = projects_tmp / dirname
+            dst_dir.mkdir()
+
+            # Copy all files in the project directory
+            for item in src_dir.iterdir():
+                if item.is_file():
+                    with open(item, "rb") as src:
+                        with open(dst_dir / item.name, "wb") as dst:
+                            dst.write(src.read())
+
+        # Copy history.jsonl if it exists
+        if HISTORY_FILE.exists():
+            with open(HISTORY_FILE, "rb") as src:
+                with open(tmpdir / "history.jsonl", "wb") as dst:
+                    dst.write(src.read())
+
+        # Create tar.gz
+        with tarfile.open(output, "w:gz") as tar:
+            for item in tmpdir.iterdir():
+                tar.add(item, arcname=item.name)
+
+    # Get file size
+    size_bytes = output.stat().st_size
+    if size_bytes < 1024:
+        size_str = f"{size_bytes}B"
+    elif size_bytes < 1024 * 1024:
+        size_str = f"{size_bytes / 1024:.1f}KB"
+    else:
+        size_str = f"{size_bytes / (1024 * 1024):.1f}MB"
+
+    total_sessions = sum(p["session_count"] for p in projects.values())
+    print(f"Exported {total_sessions} sessions from {len(projects)} projects")
+    print(f"Archive: {output} ({size_str})")
+
+    return 0
+
+
+def cmd_import(archive: Path):
+    """Import sessions from a tar.gz archive with auto-remap"""
+    if not archive.exists():
+        print(f"Error: Archive not found: {archive}")
+        return 1
+
+    # Extract to temp directory
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        try:
+            with tarfile.open(archive, "r:gz") as tar:
+                # Use data filter for safe extraction (Python 3.12+)
+                if hasattr(tarfile, 'data_filter'):
+                    tar.extractall(tmpdir, filter='data')
+                else:
+                    tar.extractall(tmpdir)
+        except tarfile.TarError as e:
+            print(f"Error: Failed to extract archive: {e}")
+            return 1
+
+        # Read manifest
+        manifest_path = tmpdir / "manifest.json"
+        if not manifest_path.exists():
+            print("Error: Archive missing manifest.json")
+            return 1
+
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+
+        old_home = manifest["source_home"]
+        new_home = str(Path.home())
+        needs_remap = old_home != new_home
+
+        if needs_remap:
+            print(f"Remapping paths: {old_home} -> {new_home}")
+
+        # Ensure claude directories exist
+        CLAUDE_DIR.mkdir(exist_ok=True)
+        PROJECTS_DIR.mkdir(exist_ok=True)
+
+        # Process projects
+        projects_tmp = tmpdir / "projects"
+        imported_sessions = 0
+        skipped_sessions = 0
+
+        if projects_tmp.exists():
+            for old_dirname in projects_tmp.iterdir():
+                if not old_dirname.is_dir():
+                    continue
+
+                # Remap directory name if needed
+                new_dirname = remap_encoded_dirname(old_dirname.name, old_home, new_home) if needs_remap else old_dirname.name
+                dst_dir = PROJECTS_DIR / new_dirname
+                dst_dir.mkdir(exist_ok=True)
+
+                # Process sessions-index.json
+                src_index = old_dirname / "sessions-index.json"
+                dst_index = dst_dir / "sessions-index.json"
+
+                if src_index.exists():
+                    with open(src_index) as f:
+                        src_data = json.load(f)
+
+                    # Load existing index if present
+                    existing_sessions = set()
+                    if dst_index.exists():
+                        with open(dst_index) as f:
+                            dst_data = json.load(f)
+                        existing_sessions = {e["sessionId"] for e in dst_data.get("entries", [])}
+                    else:
+                        dst_data = {"version": 1, "entries": []}
+
+                    # Process entries
+                    new_entries = []
+                    for entry in src_data.get("entries", []):
+                        session_id = entry["sessionId"]
+
+                        if session_id in existing_sessions:
+                            skipped_sessions += 1
+                            continue
+
+                        # Remap paths in entry
+                        if needs_remap:
+                            if "fullPath" in entry:
+                                entry["fullPath"] = remap_path(entry["fullPath"], old_home, new_home)
+                            if "projectPath" in entry:
+                                entry["projectPath"] = remap_path(entry["projectPath"], old_home, new_home)
+
+                        new_entries.append(entry)
+                        imported_sessions += 1
+
+                    # Write merged index
+                    if new_entries:
+                        dst_data["entries"].extend(new_entries)
+                        with open(dst_index, "w") as f:
+                            json.dump(dst_data, f, indent=2)
+
+                # Copy session .jsonl files
+                for item in old_dirname.iterdir():
+                    if item.suffix == ".jsonl":
+                        session_id = item.stem
+                        dst_file = dst_dir / item.name
+
+                        if dst_file.exists():
+                            continue  # Already skipped in index processing
+
+                        # Read and remap cwd fields if needed
+                        lines = []
+                        with open(item) as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    obj = json.loads(line)
+                                    if needs_remap and "cwd" in obj:
+                                        obj["cwd"] = remap_path(obj["cwd"], old_home, new_home)
+                                    lines.append(json.dumps(obj))
+                                except json.JSONDecodeError:
+                                    lines.append(line)
+
+                        with open(dst_file, "w") as f:
+                            f.write("\n".join(lines) + "\n")
+
+        # Process history.jsonl
+        src_history = tmpdir / "history.jsonl"
+        if src_history.exists():
+            # Load existing history entries
+            existing_entries = set()
+            if HISTORY_FILE.exists():
+                with open(HISTORY_FILE) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                obj = json.loads(line)
+                                key = (obj.get("timestamp"), obj.get("sessionId"))
+                                existing_entries.add(key)
+                            except json.JSONDecodeError:
+                                pass
+
+            # Process and append new entries
+            new_history_lines = []
+            with open(src_history) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        key = (obj.get("timestamp"), obj.get("sessionId"))
+
+                        if key in existing_entries:
+                            continue
+
+                        if needs_remap and "project" in obj:
+                            obj["project"] = remap_path(obj["project"], old_home, new_home)
+
+                        new_history_lines.append(json.dumps(obj))
+                    except json.JSONDecodeError:
+                        pass
+
+            if new_history_lines:
+                with open(HISTORY_FILE, "a") as f:
+                    for line in new_history_lines:
+                        f.write(line + "\n")
+
+        print(f"Imported {imported_sessions} sessions, skipped {skipped_sessions} existing")
+
+    return 0
+
+
+def cmd_push(remote: str, project_filter: str = None, session_ids: list = None):
+    """Push sessions to a remote machine"""
+    # Establish SSH connection (single password prompt)
+    print(f"Connecting to {remote}...")
+    if not ssh_connect(remote):
+        print(f"Error: Cannot connect to {remote}")
+        print("Check your password or SSH key setup.")
+        return 1
+
+    try:
+        # Check if claude-sync exists on remote
+        ret, out, err = ssh_run(remote, "which claude-sync || test -f ~/.local/bin/claude-sync && echo ~/.local/bin/claude-sync")
+        if ret != 0 or not out.strip():
+            print(f"Error: claude-sync not found on {remote}")
+            print("Install it on the remote machine first:")
+            print(f"  scp ~/.local/bin/claude-sync {remote}:~/.local/bin/")
+            ssh_disconnect()
+            return 1
+
+        remote_claude_sync = out.strip().split('\n')[-1]
+
+        # Create local export
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            # Export locally
+            print("Exporting sessions...")
+            if session_ids:
+                ret = cmd_export(Path(tmp_path), project_filter, session_ids)
+            elif project_filter:
+                ret = cmd_export(Path(tmp_path), project_filter, None)
+            else:
+                ret = cmd_export(Path(tmp_path), None, None)
+
+            if ret != 0:
+                return ret
+
+            # Transfer to remote
+            remote_tmp = "/tmp/claude-sync-transfer.tar.gz"
+            print(f"Transferring to {remote}...")
+            if not scp_to(remote, tmp_path, remote_tmp):
+                print("Error: Failed to transfer archive to remote")
+                return 1
+
+            # Import on remote
+            print("Importing on remote...")
+            ret, out, err = ssh_run(remote, f"{remote_claude_sync} import {remote_tmp}")
+            if ret != 0:
+                print(f"Error: Import failed on remote")
+                print(err)
+                return 1
+            print(out.strip())
+
+            # Cleanup remote
+            ssh_run(remote, f"rm -f {remote_tmp}")
+
+            print(f"\nSuccessfully pushed to {remote}")
+            return 0
+
+        finally:
+            # Cleanup local temp file
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    finally:
+        ssh_disconnect()
+
+
+def cmd_pull(remote: str, project_filter: str = None, session_ids: list = None):
+    """Pull sessions from a remote machine"""
+    # Establish SSH connection (single password prompt)
+    print(f"Connecting to {remote}...")
+    if not ssh_connect(remote):
+        print(f"Error: Cannot connect to {remote}")
+        print("Check your password or SSH key setup.")
+        return 1
+
+    try:
+        # Check if claude-sync exists on remote
+        ret, out, err = ssh_run(remote, "which claude-sync || test -f ~/.local/bin/claude-sync && echo ~/.local/bin/claude-sync")
+        if ret != 0 or not out.strip():
+            print(f"Error: claude-sync not found on {remote}")
+            print("Install it on the remote machine first:")
+            print(f"  scp ~/.local/bin/claude-sync {remote}:~/.local/bin/")
+            return 1
+
+        remote_claude_sync = out.strip().split('\n')[-1]
+
+        # Build remote export command
+        remote_tmp = "/tmp/claude-sync-transfer.tar.gz"
+        export_cmd = f"{remote_claude_sync} export -o {remote_tmp}"
+        if project_filter:
+            export_cmd += f" --project '{project_filter}'"
+        if session_ids:
+            export_cmd += " --session " + " ".join(session_ids)
+
+        # Export on remote
+        print("Exporting on remote...")
+        ret, out, err = ssh_run(remote, export_cmd)
+        if ret != 0:
+            print(f"Error: Export failed on remote")
+            print(err)
+            return 1
+        print(out.strip())
+
+        # Transfer from remote
+        with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            print(f"Transferring from {remote}...")
+            if not scp_from(remote, remote_tmp, tmp_path):
+                print("Error: Failed to transfer archive from remote")
+                return 1
+
+            # Import locally
+            print("Importing locally...")
+            ret = cmd_import(Path(tmp_path))
+            if ret != 0:
+                return ret
+
+            # Cleanup remote
+            ssh_run(remote, f"rm -f {remote_tmp}")
+
+            print(f"\nSuccessfully pulled from {remote}")
+            return 0
+
+        finally:
+            # Cleanup local temp file
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
+    finally:
+        ssh_disconnect()
+
+
+def cmd_list_remote(remote: str, show_details: bool = False):
+    """List sessions on a remote machine"""
+    print(f"Connecting to {remote}...")
+    if not ssh_connect(remote):
+        print(f"Error: Cannot connect to {remote}")
+        print("Check your password or SSH key setup.")
+        return 1
+
+    try:
+        # Check if claude-sync exists on remote
+        ret, out, err = ssh_run(remote, "which claude-sync || test -f ~/.local/bin/claude-sync && echo ~/.local/bin/claude-sync")
+        if ret != 0 or not out.strip():
+            print(f"Error: claude-sync not found on {remote}")
+            print("Install it on the remote machine first:")
+            print(f"  scp ~/.local/bin/claude-sync {remote}:~/.local/bin/")
+            return 1
+
+        remote_claude_sync = out.strip().split('\n')[-1]
+
+        # Run list command on remote
+        list_cmd = remote_claude_sync
+        if show_details:
+            list_cmd += " --details"
+
+        ret, out, err = ssh_run(remote, list_cmd)
+        if ret != 0:
+            print(f"Error: Failed to list sessions on remote")
+            print(err)
+            return 1
+
+        print(f"\n=== Sessions on {remote} ===")
+        print(out)
+        return 0
+
+    finally:
+        ssh_disconnect()
+
+
+# === Main ===
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Transfer Claude Code sessions between machines",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  claude-sync                            List local sessions
+  claude-sync --details                  List with session details
+  claude-sync list user@host             List sessions on remote machine
+
+  claude-sync push user@host             Push all sessions to remote
+  claude-sync push user@host -s abc123   Push specific session
+  claude-sync push user@host -p myproj   Push specific project
+
+  claude-sync pull user@host             Pull all sessions from remote
+  claude-sync pull user@host -s abc123   Pull specific session
+
+  claude-sync export                     Export to local file
+  claude-sync import backup.tar.gz       Import from local file
+"""
+    )
+
+    parser.add_argument("--details", action="store_true",
+                        help="Show individual sessions in list")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # List command (supports remote)
+    list_parser = subparsers.add_parser("list", help="List sessions (local or remote)")
+    list_parser.add_argument("remote", nargs="?", type=str, default=None,
+                             help="Remote host (user@host or user@host:port)")
+    list_parser.add_argument("--details", action="store_true",
+                             help="Show individual sessions")
+
+    # Push command
+    push_parser = subparsers.add_parser("push", help="Push sessions to remote machine")
+    push_parser.add_argument("remote", type=str,
+                             help="Remote host (user@host or user@host:port)")
+    push_parser.add_argument("-p", "--project", type=str, default=None,
+                             help="Push only this project")
+    push_parser.add_argument("-s", "--session", type=str, nargs="+", default=None,
+                             help="Push specific session(s) by ID")
+
+    # Pull command
+    pull_parser = subparsers.add_parser("pull", help="Pull sessions from remote machine")
+    pull_parser.add_argument("remote", type=str,
+                             help="Remote host (user@host or user@host:port)")
+    pull_parser.add_argument("-p", "--project", type=str, default=None,
+                             help="Pull only this project")
+    pull_parser.add_argument("-s", "--session", type=str, nargs="+", default=None,
+                             help="Pull specific session(s) by ID")
+
+    # Export command (local file)
+    export_parser = subparsers.add_parser("export", help="Export sessions to local archive")
+    export_parser.add_argument("-o", "--output", type=Path, default=DEFAULT_EXPORT,
+                               help=f"Output file (default: {DEFAULT_EXPORT})")
+    export_parser.add_argument("-p", "--project", type=str, default=None,
+                               help="Export only this project (by name)")
+    export_parser.add_argument("-s", "--session", type=str, nargs="+", default=None,
+                               help="Export specific session(s) by ID (can use prefix)")
+
+    # Import command (local file)
+    import_parser = subparsers.add_parser("import", help="Import sessions from local archive")
+    import_parser.add_argument("archive", type=Path, help="Archive file to import")
+
+    args = parser.parse_args()
+
+    if args.command == "list":
+        if args.remote:
+            return cmd_list_remote(args.remote, args.details)
+        else:
+            return cmd_list(args.details)
+    elif args.command == "push":
+        return cmd_push(args.remote, args.project, args.session)
+    elif args.command == "pull":
+        return cmd_pull(args.remote, args.project, args.session)
+    elif args.command == "export":
+        return cmd_export(args.output, args.project, args.session)
+    elif args.command == "import":
+        return cmd_import(args.archive)
+    else:
+        # Default to list local
+        return cmd_list(args.details)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
