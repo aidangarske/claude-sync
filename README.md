@@ -13,7 +13,7 @@ cd claude-sync
 Or install directly:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aidangarske/claude-sync/main/src/claude-sync -o ~/.local/bin/claude-sync && chmod +x ~/.local/bin/claude-sync
+curl -fsSL https://raw.githubusercontent.com/aidangarske/claude-sync/master/src/claude-sync -o ~/.local/bin/claude-sync && chmod +x ~/.local/bin/claude-sync
 ```
 
 **Install on BOTH machines** (source and destination).
